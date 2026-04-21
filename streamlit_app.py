@@ -28,6 +28,19 @@ def color_to_rgba_alpha(color, alpha=0.18):
     return f"rgba(0,0,0,{alpha})"
 
 
+def inside_legend(x=0.8, y=0.98):
+    return dict(
+        x=x,
+        y=y,
+        xanchor="right",
+        yanchor="top",
+        bgcolor="rgba(255,255,255,0.78)",
+        bordercolor="rgba(0,0,0,0.12)",
+        borderwidth=1,
+        orientation="v",
+    )
+
+
 # ============================================================================
 # Configuration & Constants
 # ============================================================================
@@ -154,6 +167,27 @@ def simulate_levels_across_distances(
     return distance_bins, distance_bin_levels, all_distances, all_levels
 
 
+def calculate_expected_received_level(
+    distance,
+    source_level_mean,
+    offset,
+    frequency,
+    hab_atten_per_kHz_100m,
+    atm_atten_per_m,
+    singing_height,
+):
+    """Return the deterministic expected received level at a given horizontal distance."""
+    distance_3d = np.sqrt(np.asarray(distance) ** 2 + singing_height**2)
+    distance_3d = np.clip(distance_3d, 1, None)
+    return (
+        source_level_mean
+        + offset
+        - 20 * np.log10(distance_3d)
+        - atm_atten_per_m * distance_3d
+        - hab_atten_per_kHz_100m * (distance_3d / 100) * frequency / 1000
+    )
+
+
 def measure_mean_and_pct(
     simulated_levels, simulated_distances, levels, tolerance=5, pcts=None
 ):
@@ -266,6 +300,10 @@ def evaluate_truncation_from_simulation(
     truncation_distances,
 ):
     """Evaluate truncation metrics from pre-simulated distance/level data."""
+    valid_level_mask = all_levels >= 30
+    all_distances = all_distances[valid_level_mask]
+    all_levels = all_levels[valid_level_mask]
+
     levels = np.linspace(all_levels.min(), all_levels.max(), 100)
     expectation_distances, _ = measure_mean_and_pct(
         simulated_levels=all_levels,
@@ -314,6 +352,10 @@ def evaluate_truncation_from_simulation(
     return pd.DataFrame(metrics)
 
 
+def dataframe_to_csv_bytes(df):
+    return df.to_csv(index=False).encode("utf-8")
+
+
 @st.cache_data(show_spinner=False)
 def build_simulation_bundle(
     frequency,
@@ -323,7 +365,7 @@ def build_simulation_bundle(
     offset,
     temp_C,
     rel_humidity,
-    pressure_pa,
+    pressure_atm,
     singing_height,
     residual_sd,
     max_distance,
@@ -331,6 +373,7 @@ def build_simulation_bundle(
 ):
     """Run simulations once per habitat attenuation and reuse across charts."""
     bundle = {}
+    pressure_pa = 101325 * pressure_atm
     atm_atten = atmospheric_att_coef_dB(
         frequency,
         temp_C,
@@ -375,7 +418,59 @@ def build_simulation_bundle(
 # Streamlit App
 # ============================================================================
 
+
+st.set_page_config(layout="wide")  # Optional: uses more screen width
+
+st.markdown(
+    """
+    <style>
+        .block-container {
+            padding-top: 1rem;
+            padding-bottom: 0rem;
+            margin-top: 0rem;
+            padding-left: 1rem;
+            padding-right: 1rem;
+        }
+    </style>
+""",
+    unsafe_allow_html=True,
+)
+
+hide_main_content_style = """
+                <style>
+                .st-emotion-cache-1jicfl2{
+                     padding: 0rem 1rem 10rem;
+                }
+                </style>
+                """
+st.markdown(hide_main_content_style, unsafe_allow_html=True)
+
 st.set_page_config(page_title="Bird Detection Parameter Explorer", layout="wide")
+
+st.markdown(
+    """
+    <style>
+    @media (max-width: 1100px) {
+        div[data-testid="stHorizontalBlock"] {
+            flex-direction: column;
+        }
+        div[data-testid="stHorizontalBlock"] > div,
+        div[data-testid="column"] {
+            width: 100% !important;
+            min-width: 100% !important;
+            flex: 1 1 100% !important;
+            flex-basis: 100% !important;
+            max-width: 100% !important;
+            display: block !important;
+        }
+        div[data-testid="column"] > div {
+            width: 100% !important;
+        }
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
 # Initialize session state
 if "use_species" not in st.session_state:
@@ -386,6 +481,35 @@ if "use_species" not in st.session_state:
 # ============================================================================
 
 with st.sidebar:
+    with st.expander("Info/Instructions", expanded=False):
+        st.markdown(
+            """
+    This app explores how received level, uncertainty, attenuation, and truncation behavior change with species/acoustic settings and background noise.
+
+    Throughout, source level, received level, and background level measurments are _narrow-band_ values (1kHz bandwidth) in dB SPL re 20 µPa. Distance values are for horizontal distance. Shaded areas show +/-1 SD from the mean across simulated data.
+
+    **Plots**
+    - **Detection Distance**: Expected detection distance versus selected background noise levels, with +/-1 SD ribbons from simulation.
+    - **Distance Estimate CI Width**: CI width of distance estimates versus estimated distance, using your selected CI level (80/90/95%).
+    - **Received Level vs Distance**: Mean simulated received level versus distance with +/-1 SD band, censored where expected level falls below the selected noise floor.
+    - **Atmospheric + Habitat Attenuation**: Additive attenuation components per 100 m across frequency. Atmospheric attenuation is the base layer; habitat attenuation is shown as stacked increments for each selected habitat value.
+    - **Truncation Performance**: Precision and recall versus truncation distance for the selected truncation habitat attenuation.
+
+    **How Controls Map to Panels**
+    - **Use species defaults** locks frequency, source level, and singing height to the chosen species.
+    - Turning species defaults off enables manual frequency/source level (and singing height) control.
+    - **Habitat Attenuation for Detection/CI** drives Detection, CI Width, Received Level, and Attenuation panels.
+    - **Habitat Attenuation for Truncation** drives only the Truncation panel.
+    - **Narrow-band Background Noise Levels** controls noise values used in Detection and the censoring threshold for Received Level.
+    - **Atmospheric Conditions** (temperature, RH, pressure in atm) are used to calculate atmospheric attenuation (in combination with frequency).
+    - **Advanced Settings** control song source level variance, residual received level variance, and region offset.
+
+    The mechanistic model follows Lapp, Kitzes et al. (in prep). Expand each table under a plot to inspect values and download the displayed data.
+    """
+        )
+
+    download_full_sim_placeholder = st.empty()
+
     st.header("Settings")
 
     # === Main Settings ===
@@ -410,7 +534,7 @@ with st.sidebar:
         )
     else:
         source_level = st.slider(
-            "Mean Source Level (dB SPL)",
+            "Mean Narrow-band Source Level (dB SPL)",
             min_value=50,
             max_value=110,
             value=90,
@@ -431,25 +555,27 @@ with st.sidebar:
             step=0.5,
         )
 
+    st.subheader("Atmospheric Conditions")
+    temp_C = st.slider("Temperature (°C)", min_value=-20, max_value=40, value=20)
+    rel_humidity = st.slider(
+        "Relative Humidity (%)", min_value=10, max_value=100, value=60
+    )
+    pressure_atm = st.number_input(
+        "Pressure (atm)", value=1.0, step=0.01, format="%.2f"
+    )
+
     # === Advanced Settings ===
     with st.expander("Advanced Settings"):
         col1, col2 = st.columns(2)
         with col1:
-            temp_C = st.slider(
-                "Temperature (°C)", min_value=-20, max_value=40, value=20
-            )
-            rel_humidity = st.slider(
-                "Relative Humidity (%)", min_value=10, max_value=100, value=60
-            )
-            pressure_pa = st.number_input("Pressure (Pa)", value=101325, step=100)
-
-        with col2:
             song_rl_sd = st.slider(
                 "Song RL SD (dB)", min_value=1.0, max_value=10.0, value=3.0, step=0.1
             )
             residual_sd = st.slider(
                 "Residual SD (dB)", min_value=1.0, max_value=10.0, value=4.2, step=0.1
             )
+
+        with col2:
             offset = st.slider(
                 "Region Offset (dB)",
                 min_value=-10.0,
@@ -485,12 +611,15 @@ with st.sidebar:
         index=1,
         key="hab_trunc",
     )
-    noise_levels = st.multiselect(
+    noise_range = st.slider(
         "Narrow-band Background Noise Levels (dB SPL)",
-        options=list(range(20, 61, 5)),
-        default=[25, 30, 35, 40, 45],
+        min_value=10,
+        max_value=60,
+        value=(25, 45),
+        step=5,
         key="dd_noise",
     )
+    noise_levels = list(range(noise_range[0], noise_range[1] + 1, 5))
     if use_species:
         st.caption(f"Frequency locked to species: {int(base_frequency)} Hz")
 
@@ -502,6 +631,7 @@ with st.sidebar:
         key="trunc_dist",
     )
 
+
 # ============================================================================
 # MAIN CONTENT - SINGLE-SCREEN DASHBOARD
 # ============================================================================
@@ -510,6 +640,9 @@ selected_frequency = int(base_frequency)
 requested_hab_attens = sorted(set(hab_attens_for_plots + [truncation_hab_atten]))
 
 if not hab_attens_for_plots:
+    download_full_sim_placeholder.info(
+        "Select at least one habitat attenuation value to enable full simulated data download."
+    )
     st.warning("Select at least one habitat attenuation value for Detection/CI.")
 else:
     simulation_max_distance = 3 * max_distance
@@ -523,14 +656,38 @@ else:
             offset=offset,
             temp_C=temp_C,
             rel_humidity=rel_humidity,
-            pressure_pa=pressure_pa,
+            pressure_atm=pressure_atm,
             singing_height=singing_height,
             residual_sd=residual_sd,
             max_distance=simulation_max_distance,
             N_per_bin=N_per_bin,
         )
 
-    col_detect, col_ci, col_trunc = st.columns(3)
+    full_simulation_data = []
+    for hab_atten in sorted(simulation_bundle.keys()):
+        sim = simulation_bundle[hab_atten]
+        full_simulation_data.append(
+            pd.DataFrame(
+                {
+                    "Habitat Attenuation (dB/kHz/100m)": hab_atten,
+                    "Frequency (Hz)": selected_frequency,
+                    "Distance (m)": sim["all_distances"],
+                    "Received Level (dB SPL)": sim["all_levels"],
+                }
+            )
+        )
+
+    if full_simulation_data:
+        full_sim_df = pd.concat(full_simulation_data, ignore_index=True)
+        download_full_sim_placeholder.download_button(
+            label="Download Full Simulated Data (CSV)",
+            data=dataframe_to_csv_bytes(full_sim_df),
+            file_name="full_simulated_data.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
+
+    col_detect, col_level, col_ci = st.columns(3)
 
     with col_detect:
         if hab_attens_for_plots and noise_levels:
@@ -630,6 +787,7 @@ else:
                     template="plotly_white",
                     xaxis_title="Background Noise Level (dB SPL)",
                     yaxis_title="Detection Distance (m)",
+                    legend=inside_legend(),
                     showlegend=True,
                 )
                 st.plotly_chart(fig_detect, use_container_width=True)
@@ -638,18 +796,142 @@ else:
                     st.dataframe(
                         df_detect.sort_values(
                             ["Habitat Attenuation", "Noise Level (dB SPL)"]
-                        ).style.format(
+                        ).round(
                             {
-                                "Habitat Attenuation": "{:.1f}",
-                                "Noise Level (dB SPL)": "{:.0f}",
-                                "Mean Detection Distance (m)": "{:.2f}",
-                                "Lower SD": "{:.2f}",
-                                "Upper SD": "{:.2f}",
+                                "Habitat Attenuation": 1,
+                                "Noise Level (dB SPL)": 0,
+                                "Mean Detection Distance (m)": 2,
+                                "Lower SD": 2,
+                                "Upper SD": 2,
                             }
                         ),
                         use_container_width=True,
                         hide_index=True,
                     )
+
+    with col_level:
+        noise_floor = min(noise_levels) if noise_levels else 0
+        level_bin_width = 10
+        fig_level = go.Figure()
+        level_tables = []
+        pressure_pa = 101325 * pressure_atm
+
+        for i, level_hab_atten in enumerate(sorted(hab_attens_for_plots)):
+            sim = simulation_bundle[level_hab_atten]
+            atm_atten = atmospheric_att_coef_dB(
+                selected_frequency,
+                temp_C,
+                rel_humidity,
+                pressure_pa,
+            )
+            distance_grid = np.arange(0, simulation_max_distance + 1, 1)
+            expected_curve = calculate_expected_received_level(
+                distance=distance_grid,
+                source_level_mean=source_level,
+                offset=offset,
+                frequency=selected_frequency,
+                hab_atten_per_kHz_100m=level_hab_atten,
+                atm_atten_per_m=atm_atten,
+                singing_height=singing_height,
+            )
+            above_noise = distance_grid[expected_curve >= noise_floor]
+            noise_cutoff_distance = int(above_noise.max()) if len(above_noise) else 0
+
+            level_df = pd.DataFrame(
+                {
+                    "Distance (m)": sim["all_distances"],
+                    "Received Level (dB SPL)": sim["all_levels"],
+                }
+            )
+            level_df = level_df[level_df["Distance (m)"] <= noise_cutoff_distance]
+            level_df["Distance Bin (m)"] = (
+                np.floor(level_df["Distance (m)"] / level_bin_width) * level_bin_width
+            ).astype(int)
+            level_summary = (
+                level_df.groupby("Distance Bin (m)", as_index=False)
+                .agg(
+                    Mean_Level=("Received Level (dB SPL)", "mean"),
+                    Lower_SD=(
+                        "Received Level (dB SPL)",
+                        lambda s: s.mean() - s.std(ddof=0),
+                    ),
+                    Upper_SD=(
+                        "Received Level (dB SPL)",
+                        lambda s: s.mean() + s.std(ddof=0),
+                    ),
+                )
+                .sort_values("Distance Bin (m)")
+            )
+            level_summary["Habitat"] = f"A_hab={level_hab_atten}"
+            level_tables.append(level_summary)
+
+            color = px.colors.qualitative.Set2[i % len(px.colors.qualitative.Set2)]
+            fig_level.add_trace(
+                go.Scatter(
+                    x=level_summary["Distance Bin (m)"],
+                    y=level_summary["Lower_SD"],
+                    mode="lines",
+                    line=dict(width=0),
+                    showlegend=False,
+                    hoverinfo="skip",
+                )
+            )
+            fig_level.add_trace(
+                go.Scatter(
+                    x=level_summary["Distance Bin (m)"],
+                    y=level_summary["Upper_SD"],
+                    mode="lines",
+                    line=dict(width=0),
+                    fill="tonexty",
+                    fillcolor=color_to_rgba_alpha(color, alpha=0.18),
+                    showlegend=False,
+                    hoverinfo="skip",
+                )
+            )
+            fig_level.add_trace(
+                go.Scatter(
+                    x=level_summary["Distance Bin (m)"],
+                    y=level_summary["Mean_Level"],
+                    mode="lines+markers",
+                    line=dict(color=color, width=2),
+                    marker=dict(size=6),
+                    name=f"A_hab={level_hab_atten}",
+                    hovertemplate="Distance: %{x:.0f} m<br>Mean level: %{y:.1f} dB SPL<extra>A_hab="
+                    + str(level_hab_atten)
+                    + "</extra>",
+                )
+            )
+
+        level_df_all = (
+            pd.concat(level_tables, ignore_index=True)
+            if level_tables
+            else pd.DataFrame()
+        )
+        fig_level.update_layout(
+            hovermode="x unified",
+            height=340,
+            margin=dict(l=10, r=10, t=10, b=10),
+            template="plotly_white",
+            xaxis_title="Distance (m)",
+            yaxis_title="Received Level (dB SPL)",
+            legend=inside_legend(),
+            showlegend=True,
+        )
+        st.plotly_chart(fig_level, use_container_width=True)
+
+        with st.expander("Received level table"):
+            st.dataframe(
+                level_df_all.style.format(
+                    {
+                        "Distance Bin (m)": "{:.0f}",
+                        "Mean_Level": "{:.2f}",
+                        "Lower_SD": "{:.2f}",
+                        "Upper_SD": "{:.2f}",
+                    }
+                ),
+                use_container_width=True,
+                hide_index=True,
+            )
 
     with col_ci:
         if hab_attens_for_plots:
@@ -678,7 +960,7 @@ else:
                         ci_rows.append(
                             {
                                 "Distance Estimate (m)": dist,
-                                "CI Width (m)": width,
+                                f"Distance Estimate {ci_pct}% CI Width (m)": width,
                                 "Habitat": f"A_hab={hab_atten}",
                             }
                         )
@@ -688,7 +970,7 @@ else:
                 fig_ci = px.line(
                     df_ci,
                     x="Distance Estimate (m)",
-                    y="CI Width (m)",
+                    y=f"Distance Estimate {ci_pct}% CI Width (m)",
                     color="Habitat",
                     markers=True,
                     color_discrete_sequence=px.colors.qualitative.Set2,
@@ -699,23 +981,110 @@ else:
                     height=340,
                     margin=dict(l=10, r=10, t=10, b=10),
                     template="plotly_white",
+                    legend=inside_legend(x=0.3),
                     showlegend=True,
                 )
                 st.plotly_chart(fig_ci, use_container_width=True)
 
                 with st.expander("CI table"):
                     st.dataframe(
-                        df_ci.sort_values(
-                            ["Habitat", "Distance Estimate (m)"]
-                        ).style.format(
+                        df_ci.sort_values(["Habitat", "Distance Estimate (m)"]).round(
                             {
-                                "Distance Estimate (m)": "{:.2f}",
-                                "CI Width (m)": "{:.2f}",
+                                "Distance Estimate (m)": 2,
+                                "CI Width (m)": 2,
                             }
                         ),
                         use_container_width=True,
                         hide_index=True,
                     )
+
+    col_atten, col_trunc, _ = st.columns(3)
+
+    with col_atten:
+        attenuation_freqs = np.arange(50, 12001, 50)
+        atm_atten_per_m_curve = atmospheric_att_coef_dB(
+            attenuation_freqs,
+            temp_C,
+            rel_humidity,
+            pressure_pa,
+        )
+        atm_atten_per_100m = atm_atten_per_m_curve * 100
+        selected_hab_attens = sorted(hab_attens_for_plots)
+        fig_atten = go.Figure()
+        fig_atten.add_trace(
+            go.Scatter(
+                x=attenuation_freqs,
+                y=atm_atten_per_100m,
+                mode="lines",
+                name="Atmospheric attenuation",
+                line=dict(color=px.colors.qualitative.Set2[0], width=2),
+                stackgroup="atten",
+                hovertemplate="Frequency: %{x:.0f} Hz<br>Atmospheric: %{y:.2f} dB/100m<extra>Atmospheric attenuation</extra>",
+            )
+        )
+
+        previous_hab = 0.0
+        base_hab_color = px.colors.qualitative.Set2[1]
+        for i, hab_atten in enumerate(selected_hab_attens):
+            increment_hab = hab_atten - previous_hab
+            if increment_hab <= 0:
+                previous_hab = hab_atten
+                continue
+
+            increment_curve = increment_hab * attenuation_freqs / 1000
+            fig_atten.add_trace(
+                go.Scatter(
+                    x=attenuation_freqs,
+                    y=increment_curve,
+                    mode="lines",
+                    name=f"A_hab={hab_atten} dB/kHz/100m",
+                    line=dict(color=base_hab_color, width=1),
+                    stackgroup="atten",
+                    fillcolor=color_to_rgba_alpha(
+                        base_hab_color, alpha=0.18 + 0.12 * i
+                    ),
+                    hovertemplate=(
+                        "Frequency: %{x:.0f} Hz<br>Increment: %{y:.2f} dB/100m<extra>A_hab="
+                        + str(hab_atten)
+                        + " dB/kHz/100m</extra>"
+                    ),
+                )
+            )
+            previous_hab = hab_atten
+
+        fig_atten.update_layout(
+            hovermode="x unified",
+            height=340,
+            margin=dict(l=10, r=10, t=30, b=10),
+            template="plotly_white",
+            xaxis_title="Frequency (Hz)",
+            yaxis_title="Attenuation (dB per 100 m)",
+            legend=inside_legend(),
+            showlegend=True,
+        )
+        fig_atten.update_layout(
+            legend_title_text="",
+        )
+        st.plotly_chart(fig_atten, use_container_width=True)
+
+        if selected_hab_attens:
+            atten_table = pd.DataFrame(
+                {
+                    "Frequency (Hz)": attenuation_freqs,
+                    "Atmospheric attenuation (dB/100m)": atm_atten_per_100m,
+                }
+            )
+            for hab_atten in selected_hab_attens:
+                atten_table[f"A_hab={hab_atten} (dB/100m)"] = (
+                    hab_atten * attenuation_freqs / 1000
+                )
+
+            with st.expander("Attenuation table"):
+                st.dataframe(
+                    atten_table.round(2),
+                    use_container_width=True,
+                    hide_index=True,
+                )
 
     with col_trunc:
         if truncation_distances:
@@ -752,19 +1121,20 @@ else:
                 margin=dict(l=10, r=10, t=10, b=10),
                 template="plotly_white",
                 yaxis=dict(range=[0, 1]),
+                legend=inside_legend(x=0.9, y=0.3),
                 showlegend=True,
             )
             st.plotly_chart(fig_trunc, use_container_width=True)
 
             with st.expander("Truncation table"):
                 st.dataframe(
-                    trunc_df.style.format(
+                    trunc_df.round(
                         {
-                            "truncation_distance": "{:.0f}",
-                            "truncation_level": "{:.2f}",
-                            "precision": "{:.3f}",
-                            "recall": "{:.3f}",
-                            "type_i_error": "{:.3f}",
+                            "truncation_distance": 0,
+                            "truncation_level": 2,
+                            "precision": 3,
+                            "recall": 3,
+                            "type_i_error": 3,
                         }
                     ),
                     use_container_width=True,
