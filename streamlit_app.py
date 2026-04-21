@@ -1,10 +1,11 @@
-import streamlit as st
+import os
+from functools import lru_cache
+
 import numpy as np
 import pandas as pd
-import plotly.graph_objects as go
 import plotly.express as px
-from functools import lru_cache
-import os
+import plotly.graph_objects as go
+import streamlit as st
 
 
 def color_to_rgba_alpha(color, alpha=0.18):
@@ -315,11 +316,11 @@ def evaluate_truncation_from_simulation(
 
 @st.cache_data(show_spinner=False)
 def build_simulation_bundle(
-    frequencies,
+    frequency,
+    hab_attens,
     source_level,
     song_rl_sd,
     offset,
-    hab_atten,
     temp_C,
     rel_humidity,
     pressure_pa,
@@ -328,15 +329,20 @@ def build_simulation_bundle(
     max_distance,
     N_per_bin,
 ):
-    """Run simulations once per frequency and reuse across all dashboard charts."""
+    """Run simulations once per habitat attenuation and reuse across charts."""
     bundle = {}
-    for freq in frequencies:
-        atm_atten = atmospheric_att_coef_dB(freq, temp_C, rel_humidity, pressure_pa)
+    atm_atten = atmospheric_att_coef_dB(
+        frequency,
+        temp_C,
+        rel_humidity,
+        pressure_pa,
+    )
+    for hab_atten in hab_attens:
         _, _, all_distances, all_levels = simulate_levels_across_distances(
             source_level_mean=source_level,
             song_rl_sd=song_rl_sd,
             offset=offset,
-            frequency=freq,
+            frequency=frequency,
             hab_atten_per_kHz_100m=hab_atten,
             atm_atten_per_m=atm_atten,
             height=singing_height,
@@ -354,7 +360,7 @@ def build_simulation_bundle(
             tolerance=5,
             pcts=[2.5, 5, 10, 90, 95, 97.5],
         )
-        bundle[freq] = {
+        bundle[hab_atten] = {
             "all_distances": all_distances,
             "all_levels": all_levels,
             "levels": levels,
@@ -391,8 +397,17 @@ with st.sidebar:
     if use_species:
         species = st.selectbox("Species", options=SPECIES_LIST)
         source_level = SPECIES_INFO[species]["source_level"]
-        base_frequency = SPECIES_INFO[species]["frequency"]
+        base_frequency = int(round(SPECIES_INFO[species]["frequency"]))
         singing_height = SPECIES_INFO[species]["singing_height"]
+        st.number_input(
+            "Frequency (Hz)",
+            min_value=100,
+            max_value=16000,
+            value=base_frequency,
+            step=100,
+            disabled=True,
+            help="Locked to selected species narrow-band frequency.",
+        )
     else:
         source_level = st.slider(
             "Mean Source Level (dB SPL)",
@@ -403,24 +418,18 @@ with st.sidebar:
         )
         base_frequency = st.slider(
             "Frequency (Hz)",
-            min_value=500,
-            max_value=12000,
+            min_value=100,
+            max_value=16000,
             value=5000,
             step=100,
         )
         singing_height = st.slider(
             "Singing Height (m)",
             min_value=0.5,
-            max_value=20.0,
-            value=2.0,
+            max_value=40.0,
+            value=5.0,
             step=0.5,
         )
-
-    hab_atten = st.selectbox(
-        "Habitat Attenuation (dB/kHz/100m)",
-        options=[0, 0.5, 1, 1.5, 2, 2.5, 3],
-        index=1,
-    )
 
     # === Advanced Settings ===
     with st.expander("Advanced Settings"):
@@ -463,25 +472,29 @@ with st.sidebar:
 
     st.markdown("---")
     st.subheader("Chart Controls")
+    hab_atten_options = [0, 0.5, 1, 1.5, 2, 2.5, 3, 3.5, 4, 4.5, 5]
+    hab_attens_for_plots = st.multiselect(
+        "Habitat Attenuation for Detection/CI (dB/kHz/100m)",
+        options=hab_atten_options,
+        default=[0, 2],
+        key="hab_multi",
+    )
+    truncation_hab_atten = st.selectbox(
+        "Habitat Attenuation for Truncation",
+        options=hab_atten_options,
+        index=1,
+        key="hab_trunc",
+    )
     noise_levels = st.multiselect(
-        "Detection Noise Levels (dB SPL)",
+        "Narrow-band Background Noise Levels (dB SPL)",
         options=list(range(20, 61, 5)),
-        default=[30, 40, 50],
+        default=[25, 30, 35, 40, 45],
         key="dd_noise",
     )
-    frequencies_to_plot = st.multiselect(
-        "Detection Frequencies (Hz)",
-        options=list(range(100, 401, 100)) + list(range(500, 16001, 500)),
-        default=[1000, 3000, 5000, 8000],
-        key="dd_freq",
-    )
+    if use_species:
+        st.caption(f"Frequency locked to species: {int(base_frequency)} Hz")
+
     ci_pct = st.selectbox("CI Level", options=[80, 90, 95], index=2, key="ci_pct")
-    frequencies_ci = st.multiselect(
-        "CI Frequencies (Hz)",
-        options=list(range(100, 401, 100)) + list(range(500, 12001, 500)),
-        default=[1000, 3000, 5000, 8000],
-        key="ci_freq",
-    )
     truncation_distances = st.multiselect(
         "Truncation Distances (m)",
         options=list(range(25, 351, 5)),
@@ -493,22 +506,21 @@ with st.sidebar:
 # MAIN CONTENT - SINGLE-SCREEN DASHBOARD
 # ============================================================================
 
-all_requested_freqs = sorted(
-    set(frequencies_to_plot) | set(frequencies_ci) | {int(base_frequency)}
-)
+selected_frequency = int(base_frequency)
+requested_hab_attens = sorted(set(hab_attens_for_plots + [truncation_hab_atten]))
 
-if not all_requested_freqs:
-    st.warning("Select at least one frequency in Detection or CI controls.")
+if not hab_attens_for_plots:
+    st.warning("Select at least one habitat attenuation value for Detection/CI.")
 else:
     simulation_max_distance = 3 * max_distance
 
     with st.spinner("Running shared simulation bundle..."):
         simulation_bundle = build_simulation_bundle(
-            frequencies=tuple(all_requested_freqs),
+            frequency=selected_frequency,
+            hab_attens=tuple(requested_hab_attens),
             source_level=source_level,
             song_rl_sd=song_rl_sd,
             offset=offset,
-            hab_atten=hab_atten,
             temp_C=temp_C,
             rel_humidity=rel_humidity,
             pressure_pa=pressure_pa,
@@ -521,11 +533,11 @@ else:
     col_detect, col_ci, col_trunc = st.columns(3)
 
     with col_detect:
-        if frequencies_to_plot and noise_levels:
-            detection_tol = 0.5
+        if hab_attens_for_plots and noise_levels:
+            detection_tol = 1
             detection_stats = []
-            for freq in frequencies_to_plot:
-                sim = simulation_bundle[freq]
+            for hab_atten in sorted(hab_attens_for_plots):
+                sim = simulation_bundle[hab_atten]
                 all_levels = sim["all_levels"]
                 all_distances = sim["all_distances"]
 
@@ -540,8 +552,9 @@ else:
                     sd_distance = float(np.std(distances_at_level, ddof=0))
                     detection_stats.append(
                         {
-                            "Frequency (Hz)": freq,
-                            "Noise Level": f"{noise_level} dB",
+                            "Habitat Attenuation": hab_atten,
+                            "Habitat Label": f"A_hab={hab_atten}",
+                            "Noise Level (dB SPL)": noise_level,
                             "Mean Detection Distance (m)": mean_distance,
                             "Lower SD": max(0.0, mean_distance - sd_distance),
                             "Upper SD": mean_distance + sd_distance,
@@ -551,20 +564,20 @@ else:
             if detection_stats:
                 df_detect = pd.DataFrame(detection_stats)
                 fig_detect = go.Figure()
-                noise_labels = sorted(df_detect["Noise Level"].unique())
+                hab_labels = sorted(df_detect["Habitat Label"].unique())
                 palette = px.colors.qualitative.Set2
 
-                for i, noise_label in enumerate(noise_labels):
+                for i, hab_label in enumerate(hab_labels):
                     color = palette[i % len(palette)]
                     shade_color = color_to_rgba_alpha(color, alpha=0.18)
                     subset = df_detect[
-                        df_detect["Noise Level"] == noise_label
-                    ].sort_values("Frequency (Hz)")
+                        df_detect["Habitat Label"] == hab_label
+                    ].sort_values("Noise Level (dB SPL)")
 
                     # Lower bound (invisible line) for shaded SD band.
                     fig_detect.add_trace(
                         go.Scatter(
-                            x=subset["Frequency (Hz)"],
+                            x=subset["Noise Level (dB SPL)"],
                             y=subset["Lower SD"],
                             mode="lines",
                             line=dict(width=0),
@@ -576,7 +589,7 @@ else:
                     # Upper bound filled to previous trace to create +/-1 SD ribbon.
                     fig_detect.add_trace(
                         go.Scatter(
-                            x=subset["Frequency (Hz)"],
+                            x=subset["Noise Level (dB SPL)"],
                             y=subset["Upper SD"],
                             mode="lines",
                             line=dict(width=0),
@@ -590,21 +603,21 @@ else:
                     # Mean line on top of shaded band.
                     fig_detect.add_trace(
                         go.Scatter(
-                            x=subset["Frequency (Hz)"],
+                            x=subset["Noise Level (dB SPL)"],
                             y=subset["Mean Detection Distance (m)"],
                             mode="lines+markers",
-                            name=noise_label,
+                            name=hab_label,
                             line=dict(color=color, width=2),
                             marker=dict(size=7),
                             customdata=np.stack(
                                 [subset["Lower SD"], subset["Upper SD"]], axis=-1
                             ),
                             hovertemplate=(
-                                "Frequency: %{x:.0f} Hz<br>"
+                                "Noise level: %{x:.0f} dB SPL<br>"
                                 "Mean distance: %{y:.1f} m<br>"
                                 "-1 SD: %{customdata[0]:.1f} m<br>"
                                 "+1 SD: %{customdata[1]:.1f} m<extra>"
-                                + noise_label
+                                + hab_label
                                 + "</extra>"
                             ),
                         )
@@ -615,7 +628,7 @@ else:
                     height=340,
                     margin=dict(l=10, r=10, t=10, b=10),
                     template="plotly_white",
-                    xaxis_title="Frequency (Hz)",
+                    xaxis_title="Background Noise Level (dB SPL)",
                     yaxis_title="Detection Distance (m)",
                     showlegend=True,
                 )
@@ -624,10 +637,11 @@ else:
                 with st.expander("Detection table"):
                     st.dataframe(
                         df_detect.sort_values(
-                            ["Noise Level", "Frequency (Hz)"]
+                            ["Habitat Attenuation", "Noise Level (dB SPL)"]
                         ).style.format(
                             {
-                                "Frequency (Hz)": "{:.0f}",
+                                "Habitat Attenuation": "{:.1f}",
+                                "Noise Level (dB SPL)": "{:.0f}",
                                 "Mean Detection Distance (m)": "{:.2f}",
                                 "Lower SD": "{:.2f}",
                                 "Upper SD": "{:.2f}",
@@ -638,10 +652,11 @@ else:
                     )
 
     with col_ci:
-        if frequencies_ci:
+        if hab_attens_for_plots:
             ci_rows = []
-            for freq in frequencies_ci:
-                sim = simulation_bundle[freq]
+            for hab_atten in sorted(hab_attens_for_plots):
+                sim = simulation_bundle[hab_atten]
+                levels = sim["levels"]
                 exp_dists = sim["exp_dists"]
                 percentiles = sim["percentiles"]
 
@@ -652,9 +667,11 @@ else:
                 else:
                     ci_width = percentiles[:, -3] - percentiles[:, 2]
 
-                for dist, width in zip(exp_dists, ci_width):
+                for received_level, dist, width in zip(levels, exp_dists, ci_width):
                     if (
-                        np.isfinite(dist)
+                        received_level >= 30
+                        and np.isfinite(received_level)
+                        and np.isfinite(dist)
                         and np.isfinite(width)
                         and dist <= max_distance
                     ):
@@ -662,7 +679,7 @@ else:
                             {
                                 "Distance Estimate (m)": dist,
                                 "CI Width (m)": width,
-                                "Frequency": f"{int(freq)} Hz",
+                                "Habitat": f"A_hab={hab_atten}",
                             }
                         )
 
@@ -672,7 +689,7 @@ else:
                     df_ci,
                     x="Distance Estimate (m)",
                     y="CI Width (m)",
-                    color="Frequency",
+                    color="Habitat",
                     markers=True,
                     color_discrete_sequence=px.colors.qualitative.Set2,
                 )
@@ -689,7 +706,7 @@ else:
                 with st.expander("CI table"):
                     st.dataframe(
                         df_ci.sort_values(
-                            ["Frequency", "Distance Estimate (m)"]
+                            ["Habitat", "Distance Estimate (m)"]
                         ).style.format(
                             {
                                 "Distance Estimate (m)": "{:.2f}",
@@ -702,8 +719,7 @@ else:
 
     with col_trunc:
         if truncation_distances:
-            trunc_freq = int(base_frequency)
-            trunc_sim = simulation_bundle[trunc_freq]
+            trunc_sim = simulation_bundle[truncation_hab_atten]
             sorted_truncation_distances = sorted(truncation_distances)
             trunc_df = evaluate_truncation_from_simulation(
                 all_distances=trunc_sim["all_distances"],
